@@ -21,8 +21,6 @@ Para la etapa de refactorización, se utilizaron herramientas de Inteligencia Ar
 
 Limpieza de strings mediante Expresiones Regulares (Regex) para normalizar nombres y direcciones.
 
-Optimización de la eficiencia del código para reducir el tiempo de ejecución.
-
 Diseño visual del cuerpo del correo para garantizar una experiencia de usuario profesional.
 
 Instalación y Uso
