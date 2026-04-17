@@ -1,0 +1,581 @@
+/ ============================================================
+//  Sistema de envío masivo de soportes de pago
+//  Arrendamientos El Castillo
+// ============================================================
+
+
+// --- Menú principal ---
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('📧 El Castillo')
+    .addItem('Enviar correos masivos', 'confirmarEnvioMasivo')
+    .addSeparator()
+    .addItem('Ver resumen de envíos', 'mostrarResumenEnvios')
+    .addItem('Restablecer estados', 'confirmarReset')
+    .addToUi();
+}
+
+
+// --- Constantes ---
+
+const NOMBRE_HOJA    = "Base_Pagos";
+const ID_CARPETA     = "14TBWRq5qgBi6BJZ2PKtOK_lfDyx2qB3T";
+const ZONA_HORARIA   = Session.getScriptTimeZone();
+
+// Índices de columnas de datos (0-based)
+const COL_CONTRATO   = 0;
+const COL_NIT        = 1;
+const COL_NOMBRE     = 2;
+const COL_VALOR      = 3;
+const COL_EGRESO     = 4;
+const COL_EMAIL      = 5;
+
+
+// ============================================================
+//  UTILIDADES GENERALES
+// ============================================================
+
+// Recibe la fecha actual y la devuelve formateada como string.
+// Se usa en varios lugares para no repetir el mismo Utilities.formatDate.
+function fechaHoy() {
+  return Utilities.formatDate(new Date(), ZONA_HORARIA, "dd/MM/yyyy");
+}
+
+function horaAhora() {
+  return Utilities.formatDate(new Date(), ZONA_HORARIA, "HH:mm:ss");
+}
+
+// Escribe estado, fecha y hora en las filas correspondientes a un NIT.
+function registrarEstado(hoja, filas, colEstado, colFecha, colHora, estado) {
+  const fecha = fechaHoy();
+  const hora  = horaAhora();
+  filas.forEach(f => {
+    hoja.getRange(f.filaExcel, colEstado).setValue(estado);
+    hoja.getRange(f.filaExcel, colFecha).setValue(fecha);
+    hoja.getRange(f.filaExcel, colHora).setValue(hora);
+  });
+}
+
+// Limpia el nombre de la administración eliminando sufijos de unidad
+// que vienen pegados en la base de datos (ej: "ALIADAS CSA 164" → "ALIADAS").
+// Si el regex falla con algún nuevo formato, revisar patronesSufijo abajo.
+function limpiarNombreAdmin(nombreCompleto) {
+  if (!nombreCompleto) return "";
+
+  let nombre = nombreCompleto.trim();
+
+  const patronesSufijo = [
+    /\s+APTO\s+\S+$/i,
+    /\s+APT\s+\S+$/i,
+    /\s+CSA\s+\S+$/i,
+    /\s+P\.H\.\s*\S*$/i,
+    /\s+PH\s+\S+$/i,
+    /\s+CASA\s+\S+$/i,
+    /\s+TORRE\s+\S+$/i,
+    /\s+\d+(\s*\-\s*\d+)?$/,
+    /\s+N[°o]?\s*\d+$/i,
+  ];
+
+  // Aplica los patrones en loop hasta que no haya nada más que eliminar
+  let anterior;
+  do {
+    anterior = nombre;
+    for (const patron of patronesSufijo) {
+      nombre = nombre.replace(patron, "").trim();
+    }
+  } while (nombre !== anterior);
+
+  nombre = nombre.replace(/[\s,\-]+$/, "").trim();
+  return nombre || nombreCompleto.trim();
+}
+
+// Devuelve o crea la columna de control buscada por nombre.
+// Así no dependemos de posiciones fijas y el script aguanta reordenamientos.
+function obtenerOCrearColumna(hoja, encabezados, nombreColumna) {
+  const idx = encabezados.indexOf(nombreColumna);
+  if (idx !== -1) return idx + 1; // ya existe, retorna posición 1-based
+
+  const nuevaCol = hoja.getLastColumn() + 1;
+  hoja.getRange(1, nuevaCol).setValue(nombreColumna);
+  return nuevaCol;
+}
+
+
+// ============================================================
+//  DIÁLOGOS DE CONFIRMACIÓN
+// ============================================================
+
+function confirmarEnvioMasivo() {
+  const ui = SpreadsheetApp.getUi();
+  const respuesta = ui.alert(
+    'Envío masivo de correos',
+    '¿Confirmas el envío?\n\n' +
+    '• Solo se procesarán los NIT sin estado "ENVIADO"\n' +
+    '• Se adjuntarán todos los soportes por inmueble\n' +
+    '• Se actualizarán las columnas de control',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (respuesta !== ui.Button.YES) {
+    ui.alert('Cancelado', 'No se envió ningún correo.', ui.ButtonSet.OK);
+    return;
+  }
+
+  ui.alert('Procesando...', 'El envío ha comenzado. Esto puede tardar unos minutos.', ui.ButtonSet.OK);
+  enviarCorreosMasivos();
+  ui.alert('Proceso completado', 'Revisa la columna "Estado" para ver los resultados.', ui.ButtonSet.OK);
+}
+
+function confirmarReset() {
+  const ui = SpreadsheetApp.getUi();
+  const respuesta = ui.alert(
+    'Restablecer estados',
+    'Advertencia: esto borrará todos los estados de envío.\n\n¿Deseas continuar?',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (respuesta === ui.Button.YES) {
+    restablecerEstados();
+    ui.alert('Completado', 'Los estados han sido restablecidos.', ui.ButtonSet.OK);
+  }
+}
+
+
+// ============================================================
+//  RESTABLECER ESTADOS
+// ============================================================
+
+function restablecerEstados() {
+  const hoja       = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(NOMBRE_HOJA);
+  const encabezados = hoja.getRange(1, 1, 1, hoja.getLastColumn()).getValues()[0];
+  const ultimaFila  = hoja.getLastRow();
+
+  const cols = ["Estado", "Fecha Envío", "Hora Envío"].map(n => encabezados.indexOf(n) + 1);
+  cols.filter(c => c > 0).forEach(c => {
+    hoja.getRange(2, c, ultimaFila - 1, 1).clearContent();
+  });
+
+  Logger.log("Estados restablecidos correctamente.");
+}
+
+
+// ============================================================
+//  RESUMEN DE ENVÍOS
+// ============================================================
+
+function mostrarResumenEnvios() {
+  const hoja       = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(NOMBRE_HOJA);
+  const datos      = hoja.getDataRange().getDisplayValues();
+  const colEstado  = datos[0].indexOf("Estado");
+
+  if (colEstado === -1) {
+    SpreadsheetApp.getUi().alert('Aviso', 'Aún no se ha ejecutado ningún envío.', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+
+  // Tomar solo el primer estado encontrado por NIT
+  const nitVistos = {};
+  for (let i = 1; i < datos.length; i++) {
+    const nit    = datos[i][COL_NIT].trim();
+    const estado = datos[i][colEstado];
+    if (!nitVistos[nit]) nitVistos[nit] = estado;
+  }
+
+  const conteo = { enviados: 0, sinEmail: 0, sinArchivo: 0, errores: 0, pendientes: 0 };
+  for (const estado of Object.values(nitVistos)) {
+    if (estado === "ENVIADO")         conteo.enviados++;
+    else if (estado === "SIN EMAIL")  conteo.sinEmail++;
+    else if (estado === "SIN ARCHIVO") conteo.sinArchivo++;
+    else if (estado.startsWith("ERROR")) conteo.errores++;
+    else                              conteo.pendientes++;
+  }
+
+  const total   = Object.keys(nitVistos).length;
+  const mensaje =
+    `RESUMEN DE ENVÍOS\n\n` +
+    `Total de administraciones: ${total}\n\n` +
+    `Enviados:    ${conteo.enviados}\n` +
+    `Pendientes:  ${conteo.pendientes}\n` +
+    `Sin email:   ${conteo.sinEmail}\n` +
+    `Sin archivo: ${conteo.sinArchivo}\n` +
+    `Errores:     ${conteo.errores}`;
+
+  SpreadsheetApp.getUi().alert('Resumen de envíos', mensaje, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+
+// ============================================================
+//  FUNCIÓN PRINCIPAL DE ENVÍO
+// ============================================================
+
+function enviarCorreosMasivos() {
+  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+  const hoja = ss.getSheetByName(NOMBRE_HOJA);
+  const datos = hoja.getDataRange().getDisplayValues();
+  const encabezados = datos[0];
+
+  // Obtener (o crear) columnas de control
+  const colEstado = obtenerOCrearColumna(hoja, encabezados, "Estado");
+  const colFecha  = obtenerOCrearColumna(hoja, encabezados, "Fecha Envío");
+  const colHora   = obtenerOCrearColumna(hoja, encabezados, "Hora Envío");
+
+  const mapaArchivos = cargarArchivosDesideDrive();
+  const nitAgrupado  = agruparFilasPorNit(datos);
+
+  let stats = { enviados: 0, omitidos: 0, errores: 0 };
+
+  for (const nit in nitAgrupado) {
+    const admin = nitAgrupado[nit];
+
+    // Si ya fue enviado en una ejecución anterior, lo saltamos
+    const estadoActual = hoja.getRange(admin.filas[0].filaExcel, colEstado).getDisplayValue();
+    if (estadoActual === "ENVIADO") {
+      Logger.log(`Omitiendo ${admin.nombreAdmin} — ya fue enviado.`);
+      stats.omitidos++;
+      continue;
+    }
+
+    if (!admin.email) {
+      Logger.log(`Sin email: ${admin.nombreAdmin}`);
+      registrarEstado(hoja, admin.filas, colEstado, colFecha, colHora, "SIN EMAIL");
+      stats.errores++;
+      continue;
+    }
+
+    const { adjuntos, faltantes } = resolverAdjuntos(admin.filas, mapaArchivos);
+
+    if (faltantes.length > 0) {
+      Logger.log(`Faltan ${faltantes.length} archivo(s) para ${admin.nombreAdmin} — correo no enviado.`);
+      registrarEstado(hoja, admin.filas, colEstado, colFecha, colHora, "SIN ARCHIVO");
+      stats.errores++;
+      continue;
+    }
+
+    try {
+      enviarCorreo(admin, adjuntos);
+      registrarEstado(hoja, admin.filas, colEstado, colFecha, colHora, "ENVIADO");
+      SpreadsheetApp.flush();
+      Logger.log(`Enviado a ${admin.nombreAdmin} (${admin.email}) — ${adjuntos.length} adjunto(s).`);
+      stats.enviados++;
+    } catch (err) {
+      Logger.log(`Error al enviar a ${admin.nombreAdmin}: ${err.message}`);
+      registrarEstado(hoja, admin.filas, colEstado, colFecha, colHora, "ERROR: " + err.message);
+      SpreadsheetApp.flush();
+      stats.errores++;
+    }
+
+    Utilities.sleep(1000);
+  }
+
+  Logger.log(`--- Proceso completado: ${stats.enviados} enviados, ${stats.omitidos} omitidos, ${stats.errores} errores ---`);
+  generarReporteEnvio(stats.enviados, stats.omitidos, stats.errores, nitAgrupado);
+}
+
+
+// ============================================================
+//  HELPERS DE LA FUNCIÓN PRINCIPAL
+// ============================================================
+
+// Lee todos los archivos de la carpeta de Drive y los indexa por el número
+// que aparece antes del primer guion en el nombre del archivo (ej: "20062_...").
+function cargarArchivosDesideDrive() {
+  const carpeta    = DriveApp.getFolderById(ID_CARPETA);
+  const iterador   = carpeta.getFiles();
+  const mapa       = {};
+
+  while (iterador.hasNext()) {
+    const archivo = iterador.next();
+    const match   = archivo.getName().match(/^(\d+)_/);
+    if (match) mapa[match[1]] = archivo;
+  }
+
+  Logger.log(`Archivos cargados desde Drive: ${Object.keys(mapa).length}`);
+  return mapa;
+}
+
+// Convierte las filas de la hoja en un objeto agrupado por NIT.
+// Cada entrada tiene los datos de la administración y un array de filas.
+function agruparFilasPorNit(datos) {
+  const agrupado = {};
+
+  for (let i = 1; i < datos.length; i++) {
+    const fila           = datos[i];
+    const nit            = fila[COL_NIT].trim();
+    const nombreCompleto = fila[COL_NOMBRE].trim();
+    const egresoCompleto = fila[COL_EGRESO].trim();
+    const partes         = egresoCompleto.split("-");
+    const numRef         = partes[partes.length - 1].trim();
+
+    if (!agrupado[nit]) {
+      agrupado[nit] = {
+        nombreAdmin: limpiarNombreAdmin(nombreCompleto),
+        email:       fila[COL_EMAIL].trim(),
+        filas:       []
+      };
+    }
+
+    agrupado[nit].filas.push({
+      filaExcel:         i + 1,
+      contrato:          fila[COL_CONTRATO].trim(),
+      valor:             fila[COL_VALOR].trim(),
+      egresoCompleto,
+      numRef,
+      direccionInmueble: nombreCompleto
+    });
+  }
+
+  return agrupado;
+}
+
+// Busca los archivos en el mapa de Drive para cada fila del grupo.
+// Devuelve dos listas: los que sí encontró y los que no.
+function resolverAdjuntos(filas, mapaArchivos) {
+  const adjuntos  = [];
+  const faltantes = [];
+
+  filas.forEach(f => {
+    if (mapaArchivos[f.numRef]) {
+      adjuntos.push({
+        blob:              mapaArchivos[f.numRef].getBlob(),
+        contrato:          f.contrato,
+        valor:             f.valor,
+        egresoCompleto:    f.egresoCompleto,
+        numRef:            f.numRef,
+        filaExcel:         f.filaExcel,
+        direccionInmueble: f.direccionInmueble
+      });
+    } else {
+      faltantes.push(f);
+      Logger.log(`Archivo no encontrado: ref ${f.numRef}`);
+    }
+  });
+
+  return { adjuntos, faltantes };
+}
+
+
+// ============================================================
+//  ENVÍO DE CORREO
+// ============================================================
+
+function enviarCorreo(admin, adjuntos) {
+  MailApp.sendEmail({
+    to:       admin.email,
+    subject:  `Soporte de pago — ${admin.nombreAdmin}`,
+    htmlBody: construirHtmlCorreo(admin, adjuntos),
+    attachments: adjuntos.map(a => a.blob)
+  });
+}
+
+// Arma el HTML del correo. Separado de enviarCorreo para que sea más
+// fácil de editar sin tocar la lógica de envío.
+function construirHtmlCorreo(admin, adjuntos) {
+  const filaTabla = adjuntos.map((adj, i) => {
+    const fondo = i % 2 === 0 ? '#f0f7f4' : '#ffffff';
+    return `
+      <tr style="background-color:${fondo}">
+        <td style="padding:12px;border-bottom:1px solid #c8e6c9;color:#1b4332;font-weight:600">${adj.contrato}</td>
+        <td style="padding:12px;border-bottom:1px solid #c8e6c9;color:#2d6a4f">${adj.direccionInmueble}</td>
+        <td style="padding:12px;border-bottom:1px solid #c8e6c9;text-align:right;color:#1b4332;font-weight:700">${adj.valor}</td>
+      </tr>`;
+  }).join("");
+
+  const tabla = `
+    <table style="border-collapse:collapse;width:100%;max-width:700px;margin:20px auto;
+                  font-family:Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.08);
+                  border-radius:8px;overflow:hidden">
+      <thead>
+        <tr style="background:linear-gradient(135deg,#1b4332,#2d6a4f);color:#fff">
+          <th style="padding:15px;font-size:14px;text-align:left">Contrato</th>
+          <th style="padding:15px;font-size:14px;text-align:left">Dirección del inmueble</th>
+          <th style="padding:15px;font-size:14px;text-align:right">Valor</th>
+        </tr>
+      </thead>
+      <tbody>${filaTabla}</tbody>
+    </table>`;
+
+  return `
+    <div style="font-family:Arial,sans-serif;max-width:800px;margin:0 auto;
+                padding:20px;background-color:#f0f7f4">
+
+      <div style="background:linear-gradient(135deg,#1b4332,#2d6a4f);
+                  padding:35px;border-radius:10px 10px 0 0;text-align:center">
+        <h2 style="color:#fff;margin:0;font-size:26px;letter-spacing:1px">
+          Arrendamientos El Castillo</h2>
+        <p style="color:#95d5b2;margin:8px 0 0;font-size:14px;font-weight:600;
+                  letter-spacing:2px;text-transform:uppercase">Reporte de pago</p>
+      </div>
+
+      <div style="background:#fff;padding:35px;border-radius:0 0 10px 10px;
+                  box-shadow:0 4px 12px rgba(0,0,0,.06)">
+
+        <p style="color:#1b4332;font-size:15px">
+          <strong>Estimado(a) administrador(a),</strong>
+        </p>
+        <p style="color:#2d6a4f;line-height:1.8;font-size:15px">
+          Reciba un cordial saludo. Le hacemos envío de los
+          <strong>soportes de pago</strong> correspondientes a los inmuebles bajo su administración.
+        </p>
+
+        <div style="background:#d8f3dc;padding:18px;border-left:5px solid #2d6a4f;
+                    margin:25px 0;border-radius:4px">
+          <p style="color:#1b4332;margin:0;font-size:14px;line-height:1.8">
+            <strong>Documentos adjuntos:</strong> ${adjuntos.length} soporte(s) de pago<br>
+            <strong>Administración:</strong> ${admin.nombreAdmin}
+          </p>
+        </div>
+
+        <p style="color:#1b4332;font-size:15px;font-weight:600">
+          Detalle de los inmuebles incluidos:
+        </p>
+
+        ${tabla}
+
+        <p style="color:#4a4a4a;line-height:1.8;font-size:15px;margin-top:30px">
+          Por favor confirmar la recepción de este correo.
+        </p>
+
+        <div style="margin-top:35px;padding-top:25px;border-top:2px solid #95d5b2">
+          <p style="color:#4a4a4a"><strong>Cordialmente,</strong></p>
+          <p style="color:#1b4332;font-weight:600;font-size:15px;margin:4px 0">
+            Maria Melisa Serna</p>
+          <p style="color:#2d6a4f;font-size:13px;margin:4px 0">Auxiliar de Operaciones</p>
+          <p style="margin:10px 0 4px">
+            <span style="color:#1b4332;font-weight:700;font-size:17px">
+              Arrendamientos El Castillo</span>
+          </p>
+          <p style="color:#2d6a4f;font-size:13px;margin:2px 0">Cra. 77 #30A 21 · Medellín, Colombia</p>
+          <p style="color:#2d6a4f;font-size:13px;margin:2px 0">318 813 3489</p>
+        </div>
+      </div>
+
+      <div style="text-align:center;margin-top:20px;padding:18px;
+                  background:#d8f3dc;border-radius:8px">
+        <p style="color:#1b4332;font-size:12px;margin:0">
+          Para consultas, responda directamente a este correo.
+        </p>
+      </div>
+    </div>`;
+}
+
+
+// ============================================================
+//  REPORTE AUTOMÁTICO EN HOJA NUEVA
+// ============================================================
+
+function generarReporteEnvio(enviados, omitidos, errores, nitAgrupado) {
+  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+  const hoja = ss.getSheetByName(NOMBRE_HOJA);
+  const datos = hoja.getDataRange().getDisplayValues();
+  const encabezados = datos[0];
+
+  const colEstadoIdx = encabezados.indexOf("Estado");
+  const colHoraIdx   = encabezados.indexOf("Hora Envío");
+  const ahora        = new Date();
+
+  const nombreHoja = "Reporte_" + Utilities.formatDate(ahora, ZONA_HORARIA, "dd-MM-yyyy_HH-mm");
+  const hojaR      = ss.insertSheet(nombreHoja);
+
+  // Encabezado principal
+  hojaR.getRange("A1:F1").merge()
+    .setValue("REPORTE DE ENVÍO MASIVO — ARRENDAMIENTOS EL CASTILLO")
+    .setFontSize(14).setFontWeight("bold").setHorizontalAlignment("center")
+    .setBackground("#1b4332").setFontColor("#ffffff");
+
+  // Fecha y hore de generación
+  hojaR.getRange("A3").setValue("Fecha:").setFontWeight("bold");
+  hojaR.getRange("B3").setValue(fechaHoy());
+  hojaR.getRange("A4").setValue("Hora:").setFontWeight("bold");
+  hojaR.getRange("B4").setValue(horaAhora());
+
+  // Cuadro de resumen
+  const total = enviados + omitidos + errores;
+  hojaR.getRange("D3:F3").merge().setValue("RESUMEN")
+    .setFontWeight("bold").setHorizontalAlignment("center").setBackground("#d8f3dc");
+
+  [
+    ["D4", "Total administraciones:", total,    "#ffffff"],
+    ["D5", "Enviados:",               enviados,  "#d4edda"],
+    ["D6", "Omitidos:",               omitidos,  "#fff3cd"],
+    ["D7", "Errores:",                errores,   "#f8d7da"]
+  ].forEach(([col, label, val, bg]) => {
+    hojaR.getRange(col).setValue(label).setFontWeight("bold");
+    hojaR.getRange(col.replace("D", "E")).setValue(val).setBackground(bg).setFontWeight("bold");
+  });
+
+  // Tabla de envío exitosos
+  let fila = 9;
+  fila = escribirSeccionReporte(hojaR, fila, "ENVÍOS EXITOSOS", ["NIT", "Nombre", "Email", "Contratos", "Direcciones", "Hora envío"]);
+
+  const filaInicioExitosos = fila;
+  for (const nit in nitAgrupado) {
+    const admin = nitAgrupado[nit];
+    const estadoFila = hoja.getRange(admin.filas[0].filaExcel, colEstadoIdx + 1).getDisplayValue();
+
+    if (estadoFila === "ENVIADO") {
+      const contratos   = admin.filas.map(f => f.contrato).join(", ");
+      const direcciones = admin.filas.map(f => f.direccionInmueble).join(" | ");
+      const horaEnvio   = colHoraIdx !== -1 ? datos[admin.filas[0].filaExcel - 1][colHoraIdx] : "";
+      hojaR.getRange(fila, 1, 1, 6).setValues([[nit, admin.nombreAdmin, admin.email, contratos, direcciones, horaEnvio]]);
+      fila++;
+    }
+  }
+  if (fila > filaInicioExitosos) {
+    hojaR.getRange(filaInicioExitosos - 1, 1, fila - filaInicioExitosos + 1, 6)
+      .setBorder(true, true, true, true, true, true);
+  }
+
+  // Tabla de problemas (cuando se generen errores)
+  if (errores > 0) {
+    fila += 2;
+    fila = escribirSeccionReporte(hojaR, fila, "PROBLEMAS", ["NIT", "Nombre", "Email", "Estado", "Observación"]);
+
+    const filaInicioProblemas = fila;
+    for (const nit in nitAgrupado) {
+      const admin = nitAgrupado[nit];
+      const estadoFila = hoja.getRange(admin.filas[0].filaExcel, colEstadoIdx + 1).getDisplayValue();
+
+      if (estadoFila !== "ENVIADO" && estadoFila !== "") {
+        const observacion =
+          estadoFila === "SIN EMAIL"       ? "No tiene correo registrado en la base" :
+          estadoFila === "SIN ARCHIVO"     ? "Archivo de soporte no encontrado en Drive" :
+          estadoFila.startsWith("ERROR")   ? estadoFila : "";
+
+        hojaR.getRange(fila, 1, 1, 5).setValues([[nit, admin.nombreAdmin, admin.email || "N/A", estadoFila, observacion]]);
+        fila++;
+      }
+    }
+
+    if (fila > filaInicioProblemas) {
+      hojaR.getRange(filaInicioProblemas - 1, 1, fila - filaInicioProblemas + 1, 5)
+        .setBorder(true, true, true, true, true, true);
+    }
+  }
+
+  // Pie de página
+  fila += 2;
+  hojaR.getRange(fila, 1, 1, 6).merge()
+    .setValue("Reporte generado automáticamente — Sistema de Envío Masivo · Arrendamientos El Castillo")
+    .setFontStyle("italic").setFontColor("#2d6a4f");
+
+  // Ancho de columnas y fila fija
+  [100, 220, 200, 150, 200, 100].forEach((w, i) => hojaR.setColumnWidth(i + 1, w));
+  hojaR.setFrozenRows(1);
+
+  Logger.log(`Reporte generado: ${nombreHoja}`);
+}
+
+// Escribe el encabezado de sección en el reporte y devuelve la siguiente fila disponible.
+function escribirSeccionReporte(hoja, fila, titulo, columnas) {
+  hoja.getRange(fila, 1, 1, columnas.length).merge()
+    .setValue(titulo).setFontSize(12).setFontWeight("bold")
+    .setBackground("#1b4332").setFontColor("#ffffff");
+  fila++;
+
+  hoja.getRange(fila, 1, 1, columnas.length)
+    .setValues([columnas]).setFontWeight("bold").setBackground("#d8f3dc");
+  fila++;
+
+  return fila;
+}
